@@ -245,6 +245,31 @@ public:
         return cur_p.data[dist(gen)].id;
     }
 
+    double calculate_uncertainty() {
+        if (vocab_size_ <= 0) {
+            throw std::runtime_error("Invalid vocabulary size");
+        }
+        
+        double entropy = 0.0;
+        double max_logp = *std::max_element(cached_logprobs_.begin(), cached_logprobs_.end());
+        
+        for (int i = 0; i < vocab_size_; i++) {
+            double logp = cached_logprobs_[i];
+            if (std::isfinite(logp)) {
+                // Subtract max_logp for numerical stability
+                double scaled_logp = logp - max_logp;
+                double p = std::exp(scaled_logp);
+                entropy -= p * logp;
+            }
+        }
+        
+        if (!std::isfinite(entropy)) {
+            throw std::runtime_error("Entropy calculation resulted in non-finite value");
+        }
+        
+        return entropy;
+    }
+
 private:
     llama_context* ctx_;
     llama_model* model_;
