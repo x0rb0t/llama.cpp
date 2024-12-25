@@ -49,23 +49,24 @@ struct ThinkingConfig {
     // Pre-thinking injection message
     const std::string pre_thinking_injection = 
         "<INTERRUPTION>\n"
-        "Nexus pauses to think privately (user won't see this reasoning process). "
-        "Nexus examines thoughts step-by-step with <THINKING> tags, challenging assumptions and "
-        "ensuring logical consistency. Must close with </THINKING> before continuing with visible response:\n"
+        "Nexus pauses to think privately about the immediate context (last part of conversation). "
+        "Looking at both the user's most recent input and Nexus's last response fragment (if available), "
+        "Nexus analyzes carefully with <THINKING> tags, challenging assumptions and "
+        "ensuring logical consistency. Analysis must be grounded in this recent context "
+        "and close with </THINKING> before continuing:\n"
         "</INTERRUPTION>\n"
         "<THINKING>\n"
-        "Nexus analyzes this carefully:\n";
+        "Analyzing the immediate conversation context:\n";
         
     const std::string pre_thinking_injection_suffix = 
         "1.";
 
     const std::string post_thinking_template = 
         "<INTERRUPTION>\n"
-        "Now that Nexus has privately analyzed:\n"
-        "1.%s\n"
-        "Nexus will continue the visible response from where paused, "
-        "incorporating these hidden insights naturally:\n"
-        "</INTERRUPTION>\n";
+        "Having analyzed the recent context:\n"
+        "1. %s\n"
+        "Nexus will continue the response naturally, maintaining coherence with "
+        "both this analysis and the preceding conversation:\n";
     };
 
 struct ThinkingResult {
@@ -169,7 +170,7 @@ private:
                                      float temp,
                                      int top_k,
                                      const ThinkingConfig& config = ThinkingConfig()) {
-        auto generation_chain = chain->checkpoint(LlamaChain::StringMode::SEPARATE);
+        auto generation_chain = chain->checkpoint();
         std::stringstream output;
         int tokens = 0;
         
@@ -275,7 +276,7 @@ private:
                     ThinkingResult result;
                     result.content = strip_tags(config, thinking_text);
                     result.uncertainty = avg_thinking_uncertainty;
-                    result.valid = !result.content.empty() && found_end;
+                    result.valid = !result.content.empty();
                     if (do_print_think && result.valid) {
                         fprintf(stdout, "%s\n>(uncertainty: %.2f)\n>%s\n", 
                                 term::META_COLOR, avg_thinking_uncertainty, term::RESET);
@@ -317,9 +318,10 @@ private:
 
                 for (int i = 0; i < config.continuation_attempts; i++) {
                     auto continuation_chain = continuation_pre_chain->checkpoint();
-                    continuation_chain << last_tokens_text;
+                    auto continuation_str = config.thinking_end + "\n" + last_tokens_text;
+                    continuation_chain << continuation_str;
                     if (do_print_think) {
-                        fprintf(stdout, "%s%s%s", term::META_COLOR, last_tokens_text.c_str(), term::RESET);
+                        fprintf(stdout, "%s%s%s", term::META_COLOR, continuation_str.c_str(), term::RESET);
                     }
 
                     ContinuationResult result;
