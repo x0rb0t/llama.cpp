@@ -7,6 +7,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <algorithm>
 
 // ANSI escape codes for terminal manipulation
 namespace term {
@@ -20,55 +21,120 @@ namespace term {
 }
 
 struct ThinkingConfig {
-    float uncertainty_threshold = 5.0f;
+    float uncertainty_threshold = 2.0f;
     int window_size = 5;
     float thinking_temperature = 0.7f;
-    int thinking_max_tokens = 100;
-    int continuation_tokens = 5;
+    int thinking_max_tokens = 1024;
+    int continuation_tokens = 32;
     int continuation_attempts = 5;
+    int last_tokens_to_keep = 5;
     
-    std::string thinking_start = "<thinking>Let me reason about this...";
-    
-    std::string thinking_end = "</thinking>";
-};
+    // Tags for thinking process
+    const std::string interruption_start = "<INTERRUPTION>";
+    const std::string interruption_end = "</INTERRUPTION>";
+    const std::string thinking_start = "<THINKING>";
+    const std::string thinking_end = "</THINKING>";
+
+    // Pre-thinking injection message
+    const std::string pre_thinking_injection = 
+        "<INTERRUPTION>\n"
+        "Nexus pauses to think privately (user won't see this reasoning process). "
+        "Nexus examines thoughts step-by-step with <THINKING> tags, challenging assumptions and "
+        "ensuring logical consistency. Must close with </THINKING> before continuing with visible response:\n"
+        "</INTERRUPTION>\n"
+        "<THINKING>\n"
+        "Nexus analyzes this carefully:\n"
+        "1.";
+
+    const std::string post_thinking_template = 
+        "<INTERRUPTION>\n"
+        "Now that Nexus has privately analyzed:\n"
+        "1.%s\n"
+        "Nexus will continue the visible response from where paused, "
+        "incorporating these hidden insights naturally:\n"
+        "</INTERRUPTION>\n";
+    };
 
 class ThinkingChat {
 private:
     llama_context* ctx;
     llama_model* model;
     std::shared_ptr<LlamaChain> base_chain;
-    std::vector<llama_chat_message> messages;
     std::vector<char> formatted_buffer;
-    int prev_len = 0;
+    
+    // Simple system message without thinking mechanics
+    const std::string SYSTEM_MESSAGE = 
+    "You are Nexus, a thoughtful AI assistant who deeply analyzes each response. "
+    "Nexus pauses to reason step-by-step, critically examines assumptions, "
+    "and synthesizes insights before continuing with precise, well-structured answers.";
 
-    // Single SYSTEM_MESSAGE definition with improved content
-    const std::string SYSTEM_MESSAGE = R"(You are Zero, an AI that can reason through uncertainty. Important: The system will automatically inject <thinking> tags when uncertainty is detected - you should never add these tags yourself. When you see a thinking tag opened by the system:
-        1. Reason through your uncertainty
-        2. Close the tag with </thinking> when done reasoning
-        3. Continue your response naturally as if the thinking section never happened
-
-        Remember: Thinking tags are for your internal reasoning process only. After closing the tag, just continue your normal response flow. Let's start chatting!)";
-
-    std::string apply_chat_template() {
-        int buffer_size = llama_n_ctx(ctx);
-        formatted_buffer.resize(buffer_size);
+    std::string strip_tags(const ThinkingConfig& config, const std::string& text) {
+        std::string result = text;
+        size_t start_pos, end_pos;
         
-        int new_len = llama_chat_apply_template(model, nullptr, messages.data(), messages.size(), 
-                                              true, formatted_buffer.data(), formatted_buffer.size());
-        
-        if (new_len > buffer_size) {
-            formatted_buffer.resize(new_len);
-            new_len = llama_chat_apply_template(model, nullptr, messages.data(), messages.size(), 
-                                              true, formatted_buffer.data(), formatted_buffer.size());
+        // Remove thinking tags
+        while ((start_pos = result.find(config.thinking_start)) != std::string::npos) {
+            result.erase(start_pos, config.thinking_start.length());
+        }
+        while ((start_pos = result.find(config.thinking_end)) != std::string::npos) {
+            result.erase(start_pos, config.thinking_end.length());
         }
         
-        if (new_len < 0) {
-            throw std::runtime_error("Failed to apply chat template");
+        // Remove interruption tags
+        while ((start_pos = result.find(config.interruption_start)) != std::string::npos) {
+            result.erase(start_pos, config.interruption_start.length());
+        }
+        while ((start_pos = result.find(config.interruption_end)) != std::string::npos) {
+            result.erase(start_pos, config.interruption_end.length());
         }
         
-        std::string prompt(formatted_buffer.begin() + prev_len, formatted_buffer.begin() + new_len);
-        prev_len = new_len;
-        return prompt;
+        return result;
+    }
+
+    std::vector<llama_token> get_last_n_tokens(std::shared_ptr<LlamaChain> chain, int n) {
+        const auto& all_tokens = chain->tokens();
+        if (all_tokens.size() <= n) return all_tokens;
+        return std::vector<llama_token>(all_tokens.end() - n, all_tokens.end());
+    }
+
+    std::string tokens_to_string(const std::vector<llama_token>& tokens) {
+        std::string result;
+        for (const auto& token : tokens) {
+            result += base_chain->token_to_string(token);
+        }
+        return result;
+    }
+
+    bool contains_forbidden_tags(const std::string& text, const ThinkingConfig& config) {
+        return text.find(config.thinking_start) != std::string::npos ||
+               text.find(config.thinking_end) != std::string::npos ||
+               text.find(config.interruption_start) != std::string::npos ||
+               text.find(config.interruption_end) != std::string::npos;
+    }
+
+    std::string format_post_thinking_injection(const std::string& thinking_content, 
+                                         const ThinkingConfig& config) {
+        // Trim whitespace and newlines
+        std::string trimmed_content = thinking_content;
+        while (!trimmed_content.empty() && std::isspace(trimmed_content.front())) {
+            trimmed_content.erase(0, 1);
+        }
+        while (!trimmed_content.empty() && std::isspace(trimmed_content.back())) {
+            trimmed_content.pop_back();
+        }
+        
+        // Escape quotes
+        size_t pos = 0;
+        while ((pos = trimmed_content.find("\"", pos)) != std::string::npos) {
+            trimmed_content.insert(pos, "\\");
+            pos += 2;
+        }
+        
+        // Format with template
+        char buffer[4096];
+        snprintf(buffer, sizeof(buffer), config.post_thinking_template.c_str(), 
+                trimmed_content.c_str());
+        return std::string(buffer);
     }
 
     std::string generate_with_thinking(std::shared_ptr<LlamaChain> chain, 
@@ -82,12 +148,16 @@ private:
         
         std::vector<float> uncertainty_window;
         bool in_thinking = false;
-        
-        // Save initial cursor position for output management
-        fprintf(stdout, "%s", term::SAVE_CURSOR);
+
+        bool do_print_think = false;
+
         
         while (tokens < max_tokens) {
             auto next_token = generation_chain->sample(temp, top_k);
+            if (llama_token_is_eog(model, next_token)) {
+                break;
+            }
+
             auto uncertainty = generation_chain->calculate_uncertainty();
             
             uncertainty_window.push_back(uncertainty);
@@ -104,98 +174,152 @@ private:
 
             if (!in_thinking && avg_uncertainty > config.uncertainty_threshold) {
                 in_thinking = true;
-                
-                // Save position before thinking output
-                //fprintf(stdout, "%s", term::SAVE_CURSOR);
-                
                 auto thinking_chain = generation_chain->checkpoint();
-                thinking_chain << config.thinking_start;
-                fprintf(stdout, "%s", config.thinking_start.c_str());
                 
+                // Store last tokens before injection
+                auto last_tokens = get_last_n_tokens(generation_chain, config.last_tokens_to_keep);
+                std::string last_tokens_text = tokens_to_string(last_tokens);
+                
+                // Insert pre-thinking injection
+                thinking_chain << config.pre_thinking_injection;
+                if (do_print_think) {
+                    fprintf(stdout, "%s", config.pre_thinking_injection.c_str());
+                }
+                
+                // Generate thinking content
                 std::string thinking_text;
                 int thinking_tokens = 0;
                 bool found_end = false;
                 
+                
+                
                 while (thinking_tokens < config.thinking_max_tokens) {
                     auto think_token = thinking_chain->sample(config.thinking_temperature * temp, top_k);
                     std::string token_text = thinking_chain->token_to_string(think_token);
-                    thinking_text += token_text;
-                    thinking_chain << think_token;
-                    fprintf(stdout, "%s", token_text.c_str());
-                    fflush(stdout);
                     
                     if (llama_token_is_eog(model, think_token)) {
-                        found_end = false;
                         break;
                     }
+
+                    thinking_text += token_text;
+                    thinking_chain << think_token;
+                    if (do_print_think) {
+                        fprintf(stdout, "%s", token_text.c_str());
+                        fflush(stdout);
+                    } else {
+                        fprintf(stdout, ".");
+                        fflush(stdout);
+                    }
+
                     if (thinking_text.find(config.thinking_end) != std::string::npos) {
                         found_end = true;
                         break;
                     }
                     thinking_tokens++;
                 }
-                
+
                 if (!found_end) {
                     thinking_chain << config.thinking_end;
-                    fprintf(stdout, "%s", config.thinking_end.c_str());
+                    thinking_text += config.thinking_end;
+                    if (do_print_think) {
+                        fprintf(stdout, "%s", config.thinking_end.c_str());
+                        fflush(stdout);
+                    }
                 }
+
+                //fprintf(stderr, "Thinking content: %s\n", thinking_text.c_str());
                 
-                // Sample continuations with better formatting
+                // Extract pure thinking content
+                std::string pure_thinking = strip_tags(config, thinking_text);
+                
+
+                if (pure_thinking.empty()) {
+                    fprintf(stderr, "Warning: Empty thinking content\n");
+                    pure_thinking = "my previous thoughts";  // fallback
+                }
+
+                // Create post-thinking injection
+                std::string post_thinking = format_post_thinking_injection(pure_thinking, config);
+                
+                
+                // Generate continuations
                 std::vector<std::pair<std::vector<llama_token>, float>> continuations;
-                //fprintf(stdout, "\n%sAnalyzing possible continuations:%s\n", term::GREEN, term::RESET);
                 
+                auto continuation_pre_chain = generation_chain->checkpoint();
+                continuation_pre_chain << post_thinking;
+                continuation_pre_chain << last_tokens_text;
+                if (do_print_think) {
+                    fprintf(stdout, "%s", post_thinking.c_str());
+                    fprintf(stdout, "%s", last_tokens_text.c_str());
+                }
+
                 for (int i = 0; i < config.continuation_attempts; i++) {
-                    //fprintf(stdout, "%s[%d]%s ", term::GREEN, i + 1, term::RESET);
-                    auto continuation_chain = thinking_chain->checkpoint();
+                    auto continuation_chain = continuation_pre_chain->checkpoint();
+                    
                     std::vector<llama_token> cont_tokens;
                     float total_uncertainty = 0.0f;
+                    std::string cont_text;
                     
                     for (int j = 0; j < config.continuation_tokens; j++) {
                         auto token = continuation_chain->sample(temp, top_k);
-                        std::string token_text = thinking_chain->token_to_string(token);
+                        if (llama_token_is_eog(model, token)) {
+                            break;
+                        }
+                        
+                        std::string token_text = continuation_chain->token_to_string(token);
+                        cont_text += token_text;
+                        
+                        // Skip continuation if it contains forbidden tags
+                        if (contains_forbidden_tags(cont_text, config)) {
+                            cont_tokens.clear();
+                            break;
+                        }
+                        
                         float unc = continuation_chain->calculate_uncertainty();
                         total_uncertainty += unc;
                         cont_tokens.push_back(token);
                         continuation_chain << token;
-                        //fprintf(stdout, "%s", token_text.c_str());
+                        if (!do_print_think) {
+                            fprintf(stdout, ".");
+                            fflush(stdout);
+                        }
                     }
-                    //fprintf(stdout, " (uncertainty: %.3f)\n", total_uncertainty / config.continuation_tokens);
                     
-                    continuations.push_back({cont_tokens, total_uncertainty / config.continuation_tokens});
-                }
-                
-                auto best_continuation = std::min_element(
-                    continuations.begin(), 
-                    continuations.end(),
-                    [](const auto& a, const auto& b) { return a.second < b.second; }
-                );
-                
-                // Restore cursor and clear thinking output
-                //fprintf(stdout, "%s", term::RESTORE_CURSOR);
-                /*for (int i = 0; i < thinking_tokens + config.continuation_attempts + 3; i++) {
-                    fprintf(stdout, "%s%s", term::CLEAR_LINE, term::MOVE_UP);
-                }
-                fprintf(stdout, "%s", term::CLEAR_LINE);*/
-                
-                // Apply best continuation
-                for (const auto& token : best_continuation->first) {
-                    if (llama_token_is_eog(model, token)) {
-                        break;
+                    if (!cont_tokens.empty()) {
+                        continuations.push_back({cont_tokens, 
+                                              total_uncertainty / config.continuation_tokens});
                     }
-                    generation_chain << token;
-                    std::string token_text = generation_chain->token_to_string(token);
-                    fprintf(stdout, "%s", token_text.c_str());
-                    output << token_text;
-                    tokens++;
+                }
+
+                if (!continuations.empty()) {
+                    auto best_continuation = std::min_element(
+                        continuations.begin(), 
+                        continuations.end(),
+                        [](const auto& a, const auto& b) { return a.second < b.second; }
+                    );
+                    for (const auto& token : best_continuation->first) {
+                        generation_chain << token;
+                        auto uncertainty = generation_chain->calculate_uncertainty();
+                        uncertainty_window.push_back(uncertainty);
+                        if (uncertainty_window.size() > config.window_size) {
+                            uncertainty_window.erase(uncertainty_window.begin());
+                        }
+
+                        std::string token_text = generation_chain->token_to_string(token);
+                        fprintf(stdout, "%s", token_text.c_str());
+                        fflush(stdout);
+                        output << token_text;
+                        tokens++;
+                    }
                 }
                 
                 in_thinking = false;
+                //clear uncertainty window
+                //uncertainty_window.clear();
                 continue;
             }
 
-            if (llama_token_is_eog(model, next_token)) {
-                break;
-            }
+            
 
             std::string new_text = generation_chain->token_to_string(next_token);
             fprintf(stdout, "%s", new_text.c_str());
@@ -210,25 +334,50 @@ private:
         return output.str();
     }
 
+    std::string apply_chat_template(std::vector<llama_chat_message> messages = {}, 
+                                  bool add_suffix = true) {
+        int buffer_size = llama_n_ctx(ctx);
+        formatted_buffer.resize(buffer_size);
+        
+        int new_len = llama_chat_apply_template(model, nullptr, messages.data(), 
+                                              messages.size(), add_suffix, 
+                                              formatted_buffer.data(), 
+                                              formatted_buffer.size());
+        
+        if (new_len > buffer_size) {
+            formatted_buffer.resize(new_len);
+            new_len = llama_chat_apply_template(model, nullptr, messages.data(), 
+                                              messages.size(), add_suffix, 
+                                              formatted_buffer.data(), 
+                                              formatted_buffer.size());
+        }
+        
+        if (new_len < 0) {
+            throw std::runtime_error("Failed to apply chat template");
+        }
+        
+        return std::string(formatted_buffer.begin(), formatted_buffer.begin() + new_len);
+    }
+
 public:
     ThinkingChat(llama_context* context, llama_model* mdl) 
         : ctx(context)
         , model(mdl) {
         base_chain = LlamaChain::create(ctx, model);
+        std::vector<llama_chat_message> messages;
         messages.push_back({"system", SYSTEM_MESSAGE.c_str()});
+        std::string prompt = apply_chat_template(messages, false);
+        //fprintf(stdout, "%s", prompt.c_str());
+        base_chain << prompt;
     }
 
     std::string chat(const std::string& user_message) {
+        std::vector<llama_chat_message> messages;
         messages.push_back({"user", user_message.c_str()});
-        std::string prompt = apply_chat_template();
-        
-        auto response_chain = base_chain->checkpoint();
-        response_chain << prompt;
-        
-        std::string response = generate_with_thinking(response_chain, 1024, 0.8f, 40);
-        messages.push_back({"assistant", response.c_str()});
-        
-        return response;
+        std::string prompt = apply_chat_template(messages, true);
+        //fprintf(stdout, "%s", prompt.c_str());
+        base_chain << prompt;
+        return generate_with_thinking(base_chain, 1024, 0.8f, 40);
     }
 };
 
@@ -253,7 +402,7 @@ int main(int argc, char** argv) {
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 8192;
-    ctx_params.n_batch = 512;
+    ctx_params.n_batch = 8192;
     
     llama_context* ctx = llama_new_context_with_model(model, ctx_params);
     if (!ctx) {
