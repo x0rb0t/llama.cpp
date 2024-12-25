@@ -17,7 +17,17 @@ namespace term {
     const char* RESTORE_CURSOR = "\033[u";
     const char* BLUE = "\033[34m";
     const char* GREEN = "\033[32m";
+    const char* CYAN = "\033[36m";
+    const char* YELLOW = "\033[33m";
+    const char* MAGENTA = "\033[35m";
+    const char* WHITE = "\033[37m";
     const char* RESET = "\033[0m";
+
+    // Define specific colors for each type of output
+    const char* THINKING_COLOR = BLUE;     // For thinking process
+    const char* CONTINUATION_COLOR = GREEN; // For continuation attempts
+    const char* OUTPUT_COLOR = WHITE;      // For final output
+    const char* META_COLOR = CYAN;         // For uncertainty and other meta information
 }
 
 struct ThinkingConfig {
@@ -62,6 +72,14 @@ struct ThinkingResult {
     std::string content;
     float uncertainty;
     bool valid;
+};
+
+struct ContinuationResult {
+    std::vector<llama_token> tokens;
+    std::string text;
+    float uncertainty;
+    bool valid;
+    std::vector<float> token_uncertainties;  // Store per-token uncertainty for more detailed analysis
 };
 
 class ThinkingChat {
@@ -156,9 +174,9 @@ private:
         int tokens = 0;
         
         std::vector<float> uncertainty_window;
-        bool in_thinking = false;
+        bool in_thinking = true;
 
-        bool do_print_think = false;
+        bool do_print_think = true;
 
         
         while (tokens < max_tokens) {
@@ -181,7 +199,7 @@ private:
                                                / uncertainty_window.size();
             }
 
-            if (!in_thinking && avg_uncertainty > config.uncertainty_threshold) {
+            if (in_thinking || avg_uncertainty > config.uncertainty_threshold) {
                 in_thinking = true;
                 auto thinking_pre_chain = generation_chain->checkpoint();
                 
@@ -194,11 +212,14 @@ private:
                 
                 thinking_pre_chain << config.pre_thinking_injection;
                 if (do_print_think) {
-                    fprintf(stdout, "%s", config.pre_thinking_injection.c_str());
+                    fprintf(stdout, "%s%s%s", term::META_COLOR, config.pre_thinking_injection.c_str(), term::RESET);
                 }
                 for (int attempt = 0; attempt < config.thinking_attempts; attempt++) {
                     auto thinking_chain = thinking_pre_chain->checkpoint();
                     thinking_chain << config.pre_thinking_injection_suffix;
+                    if (do_print_think) {
+                        fprintf(stdout, "%s%s%s", term::META_COLOR, config.pre_thinking_injection_suffix.c_str(), term::RESET);
+                    }
                     // Generate thinking content
                     std::string thinking_text;
                     int thinking_tokens = 0;
@@ -223,10 +244,10 @@ private:
                         thinking_chain << think_token;
                         
                         if (do_print_think) {
-                            fprintf(stdout, "%s", token_text.c_str());
+                            fprintf(stdout, "%s%s%s", term::THINKING_COLOR, token_text.c_str(), term::RESET);
                             fflush(stdout);
                         } else {
-                            fprintf(stdout, ".");
+                            fprintf(stdout, "%s.%s", term::THINKING_COLOR, term::RESET);
                             fflush(stdout);
                         }
 
@@ -241,7 +262,7 @@ private:
                         thinking_chain << config.thinking_end;
                         thinking_text += config.thinking_end;
                         if (do_print_think) {
-                            fprintf(stdout, "%s", config.thinking_end.c_str());
+                            fprintf(stdout, "%s%s%s", term::META_COLOR, config.thinking_end.c_str(), term::RESET);
                             fflush(stdout);
                         }
                     }
@@ -249,13 +270,16 @@ private:
                     // Calculate average uncertainty for this thinking attempt
                     float avg_thinking_uncertainty = uncertainty_samples > 0 ? 
                         total_uncertainty / uncertainty_samples : std::numeric_limits<float>::max();
-
+                    
                     // Store thinking result
                     ThinkingResult result;
                     result.content = strip_tags(config, thinking_text);
                     result.uncertainty = avg_thinking_uncertainty;
                     result.valid = !result.content.empty() && found_end;
-                    
+                    if (do_print_think && result.valid) {
+                        fprintf(stdout, "%s\n>(uncertainty: %.2f)\n>%s\n", 
+                                term::META_COLOR, avg_thinking_uncertainty, term::RESET);
+                    }
                     if (result.valid) {
                         thinking_attempts.push_back(result);
                     }
@@ -281,25 +305,27 @@ private:
                 std::string post_thinking = format_post_thinking_injection(chosen_thinking, config);
                 
                 // Generate continuations
-                std::vector<std::pair<std::vector<llama_token>, float>> continuations;
-                
+                std::vector<ContinuationResult> continuations;
+
                 auto continuation_pre_chain = generation_chain->checkpoint();
                 continuation_pre_chain << post_thinking;
-                
+                                
                 if (do_print_think) {
-                    fprintf(stdout, "%s", post_thinking.c_str());
+                    fprintf(stdout, "%s%s%s", term::META_COLOR, post_thinking.c_str(), term::RESET);
                 }
+
 
                 for (int i = 0; i < config.continuation_attempts; i++) {
                     auto continuation_chain = continuation_pre_chain->checkpoint();
-                    continuation_pre_chain << last_tokens_text;
+                    continuation_chain << last_tokens_text;
                     if (do_print_think) {
-                        fprintf(stdout, "%s", last_tokens_text.c_str());
+                        fprintf(stdout, "%s%s%s", term::META_COLOR, last_tokens_text.c_str(), term::RESET);
                     }
-                    std::vector<llama_token> cont_tokens;
+
+                    ContinuationResult result;
                     float total_uncertainty = 0.0f;
-                    std::string cont_text;
                     
+                    // Generate all tokens for this continuation attempt
                     for (int j = 0; j < config.continuation_tokens; j++) {
                         auto token = continuation_chain->sample(temp, top_k);
                         if (llama_token_is_eog(model, token)) {
@@ -307,50 +333,66 @@ private:
                         }
                         
                         std::string token_text = continuation_chain->token_to_string(token);
-                        cont_text += token_text;
+                        result.text += token_text;
                         
                         // Skip continuation if it contains forbidden tags
-                        if (contains_forbidden_tags(cont_text, config)) {
-                            cont_tokens.clear();
+                        if (contains_forbidden_tags(result.text, config)) {
+                            result.valid = false;
                             break;
                         }
                         
                         float unc = continuation_chain->calculate_uncertainty();
+                        result.token_uncertainties.push_back(unc);
                         total_uncertainty += unc;
-                        cont_tokens.push_back(token);
+                        result.tokens.push_back(token);
                         continuation_chain << token;
                         if (!do_print_think) {
-                            fprintf(stdout, "*");
+                            fprintf(stdout, "%s*%s", term::CONTINUATION_COLOR, term::RESET);
+                            fflush(stdout);
+                        } else {
+                            fprintf(stdout, "%s%s%s", term::CONTINUATION_COLOR, token_text.c_str(), term::RESET);
                             fflush(stdout);
                         }
+
                     }
-                    
-                    if (!cont_tokens.empty()) {
-                        continuations.push_back({cont_tokens, 
-                                              total_uncertainty / config.continuation_tokens});
+                    if (!result.tokens.empty()) {
+                        result.uncertainty = total_uncertainty / result.tokens.size();
+                        result.valid = true;
+                        continuations.push_back(result);
+                    }
+                    if (do_print_think) {
+                        fprintf(stdout, "%s\n>(uncertainty: %.2f)\n>%s\n", 
+                                term::META_COLOR, result.uncertainty, term::RESET);
+                        fflush(stdout);
                     }
                 }
 
                 if (!continuations.empty()) {
+                    // Find the best continuation based on average uncertainty
                     auto best_continuation = std::min_element(
                         continuations.begin(), 
                         continuations.end(),
-                        [](const auto& a, const auto& b) { return a.second < b.second; }
+                        [](const ContinuationResult& a, const ContinuationResult& b) { 
+                            return a.uncertainty < b.uncertainty; 
+                        }
                     );
-                    for (const auto& token : best_continuation->first) {
-                        generation_chain << token;
-                        auto uncertainty = generation_chain->calculate_uncertainty();
-                        uncertainty_window.push_back(uncertainty);
+                    
+                    // Apply all tokens from the best continuation in batch
+                    generation_chain << best_continuation->tokens;
+                    
+                    // Update uncertainty window with uncertainties from the chosen continuation
+                    for (float unc : best_continuation->token_uncertainties) {
+                        uncertainty_window.push_back(unc);
                         if (uncertainty_window.size() > config.window_size) {
                             uncertainty_window.erase(uncertainty_window.begin());
                         }
-
-                        std::string token_text = generation_chain->token_to_string(token);
-                        fprintf(stdout, "%s", token_text.c_str());
-                        fflush(stdout);
-                        output << token_text;
-                        tokens++;
                     }
+
+                    // Update output and token count
+                    fprintf(stdout, "%s", best_continuation->text.c_str());
+                    fflush(stdout);
+                    output << best_continuation->text;
+                    tokens += best_continuation->tokens.size();
                 }
                 
                 in_thinking = false;
