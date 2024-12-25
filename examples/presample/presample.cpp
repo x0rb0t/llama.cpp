@@ -21,13 +21,14 @@ namespace term {
 }
 
 struct ThinkingConfig {
-    float uncertainty_threshold = 2.0f;
-    int window_size = 5;
+    float uncertainty_threshold = 2.5f;
+    int window_size = 6;
     float thinking_temperature = 0.7f;
-    int thinking_max_tokens = 1024;
-    int continuation_tokens = 32;
-    int continuation_attempts = 5;
-    int last_tokens_to_keep = 5;
+    int thinking_max_tokens = 512;
+    int continuation_tokens = 128;
+    int thinking_attempts = 4;
+    int continuation_attempts = 4;
+    int last_tokens_to_keep = 16;
     
     // Tags for thinking process
     const std::string interruption_start = "<INTERRUPTION>";
@@ -43,7 +44,9 @@ struct ThinkingConfig {
         "ensuring logical consistency. Must close with </THINKING> before continuing with visible response:\n"
         "</INTERRUPTION>\n"
         "<THINKING>\n"
-        "Nexus analyzes this carefully:\n"
+        "Nexus analyzes this carefully:\n";
+        
+    const std::string pre_thinking_injection_suffix = 
         "1.";
 
     const std::string post_thinking_template = 
@@ -54,6 +57,12 @@ struct ThinkingConfig {
         "incorporating these hidden insights naturally:\n"
         "</INTERRUPTION>\n";
     };
+
+struct ThinkingResult {
+    std::string content;
+    float uncertainty;
+    bool valid;
+};
 
 class ThinkingChat {
 private:
@@ -174,88 +183,119 @@ private:
 
             if (!in_thinking && avg_uncertainty > config.uncertainty_threshold) {
                 in_thinking = true;
-                auto thinking_chain = generation_chain->checkpoint();
+                auto thinking_pre_chain = generation_chain->checkpoint();
                 
                 // Store last tokens before injection
                 auto last_tokens = get_last_n_tokens(generation_chain, config.last_tokens_to_keep);
                 std::string last_tokens_text = tokens_to_string(last_tokens);
                 
-                // Insert pre-thinking injection
-                thinking_chain << config.pre_thinking_injection;
+                // Generate multiple thinking attempts
+                std::vector<ThinkingResult> thinking_attempts;
+                
+                thinking_pre_chain << config.pre_thinking_injection;
                 if (do_print_think) {
                     fprintf(stdout, "%s", config.pre_thinking_injection.c_str());
                 }
-                
-                // Generate thinking content
-                std::string thinking_text;
-                int thinking_tokens = 0;
-                bool found_end = false;
-                
-                
-                
-                while (thinking_tokens < config.thinking_max_tokens) {
-                    auto think_token = thinking_chain->sample(config.thinking_temperature * temp, top_k);
-                    std::string token_text = thinking_chain->token_to_string(think_token);
+                for (int attempt = 0; attempt < config.thinking_attempts; attempt++) {
+                    auto thinking_chain = thinking_pre_chain->checkpoint();
+                    thinking_chain << config.pre_thinking_injection_suffix;
+                    // Generate thinking content
+                    std::string thinking_text;
+                    int thinking_tokens = 0;
+                    bool found_end = false;
+                    float total_uncertainty = 0.0f;
+                    int uncertainty_samples = 0;
                     
-                    if (llama_token_is_eog(model, think_token)) {
-                        break;
+                    while (thinking_tokens < config.thinking_max_tokens) {
+                        auto think_token = thinking_chain->sample(config.thinking_temperature * temp, top_k);
+                        std::string token_text = thinking_chain->token_to_string(think_token);
+                        
+                        if (llama_token_is_eog(model, think_token)) {
+                            break;
+                        }
+
+                        // Calculate uncertainty for this token
+                        float token_uncertainty = thinking_chain->calculate_uncertainty();
+                        total_uncertainty += token_uncertainty;
+                        uncertainty_samples++;
+
+                        thinking_text += token_text;
+                        thinking_chain << think_token;
+                        
+                        if (do_print_think) {
+                            fprintf(stdout, "%s", token_text.c_str());
+                            fflush(stdout);
+                        } else {
+                            fprintf(stdout, ".");
+                            fflush(stdout);
+                        }
+
+                        if (thinking_text.find(config.thinking_end) != std::string::npos) {
+                            found_end = true;
+                            break;
+                        }
+                        thinking_tokens++;
                     }
 
-                    thinking_text += token_text;
-                    thinking_chain << think_token;
-                    if (do_print_think) {
-                        fprintf(stdout, "%s", token_text.c_str());
-                        fflush(stdout);
-                    } else {
-                        fprintf(stdout, ".");
-                        fflush(stdout);
+                    if (!found_end) {
+                        thinking_chain << config.thinking_end;
+                        thinking_text += config.thinking_end;
+                        if (do_print_think) {
+                            fprintf(stdout, "%s", config.thinking_end.c_str());
+                            fflush(stdout);
+                        }
                     }
 
-                    if (thinking_text.find(config.thinking_end) != std::string::npos) {
-                        found_end = true;
-                        break;
+                    // Calculate average uncertainty for this thinking attempt
+                    float avg_thinking_uncertainty = uncertainty_samples > 0 ? 
+                        total_uncertainty / uncertainty_samples : std::numeric_limits<float>::max();
+
+                    // Store thinking result
+                    ThinkingResult result;
+                    result.content = strip_tags(config, thinking_text);
+                    result.uncertainty = avg_thinking_uncertainty;
+                    result.valid = !result.content.empty() && found_end;
+                    
+                    if (result.valid) {
+                        thinking_attempts.push_back(result);
                     }
-                    thinking_tokens++;
                 }
 
-                if (!found_end) {
-                    thinking_chain << config.thinking_end;
-                    thinking_text += config.thinking_end;
-                    if (do_print_think) {
-                        fprintf(stdout, "%s", config.thinking_end.c_str());
-                        fflush(stdout);
-                    }
+                // Select best thinking attempt
+                std::string chosen_thinking;
+                if (!thinking_attempts.empty()) {
+                    auto best_thinking = std::min_element(
+                        thinking_attempts.begin(),
+                        thinking_attempts.end(),
+                        [](const ThinkingResult& a, const ThinkingResult& b) {
+                            return a.uncertainty < b.uncertainty;
+                        }
+                    );
+                    chosen_thinking = best_thinking->content;
+                } else {
+                    fprintf(stderr, "Warning: No valid thinking attempts generated\n");
+                    chosen_thinking = "my previous thoughts";  // fallback
                 }
 
-                //fprintf(stderr, "Thinking content: %s\n", thinking_text.c_str());
-                
-                // Extract pure thinking content
-                std::string pure_thinking = strip_tags(config, thinking_text);
-                
-
-                if (pure_thinking.empty()) {
-                    fprintf(stderr, "Warning: Empty thinking content\n");
-                    pure_thinking = "my previous thoughts";  // fallback
-                }
-
-                // Create post-thinking injection
-                std::string post_thinking = format_post_thinking_injection(pure_thinking, config);
-                
+                // Create post-thinking injection with chosen thinking
+                std::string post_thinking = format_post_thinking_injection(chosen_thinking, config);
                 
                 // Generate continuations
                 std::vector<std::pair<std::vector<llama_token>, float>> continuations;
                 
                 auto continuation_pre_chain = generation_chain->checkpoint();
                 continuation_pre_chain << post_thinking;
-                continuation_pre_chain << last_tokens_text;
+                
                 if (do_print_think) {
                     fprintf(stdout, "%s", post_thinking.c_str());
-                    fprintf(stdout, "%s", last_tokens_text.c_str());
                 }
 
                 for (int i = 0; i < config.continuation_attempts; i++) {
                     auto continuation_chain = continuation_pre_chain->checkpoint();
-                    
+                    continuation_pre_chain << last_tokens_text;
+                    if (do_print_think) {
+                        fprintf(stdout, "%s", last_tokens_text.c_str());
+                    }
                     std::vector<llama_token> cont_tokens;
                     float total_uncertainty = 0.0f;
                     std::string cont_text;
@@ -280,7 +320,7 @@ private:
                         cont_tokens.push_back(token);
                         continuation_chain << token;
                         if (!do_print_think) {
-                            fprintf(stdout, ".");
+                            fprintf(stdout, "*");
                             fflush(stdout);
                         }
                     }
