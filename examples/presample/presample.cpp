@@ -30,43 +30,103 @@ namespace term {
     const char* META_COLOR = CYAN;         // For uncertainty and other meta information
 }
 
+enum class ThinkingOutput {
+    Verbose,    // Full output
+    Dots,       // Dots for each token
+    Silent      // No output
+};
+
+
 struct ThinkingConfig {
     float uncertainty_threshold = 2.5f;
-    int window_size = 6;
+    size_t window_size = 6;
+    float temperature = 0.8f;
     float thinking_temperature = 0.7f;
+    float continuation_temperature = 0.75f;
     int thinking_max_tokens = 512;
     int continuation_tokens = 128;
     int thinking_attempts = 4;
     int continuation_attempts = 4;
     int last_tokens_to_keep = 16;
+
+    int max_response_tokens = 4096;
+    int top_k = 40;
+    
+    ThinkingOutput thinking_output = ThinkingOutput::Verbose;
     
     // Tags for thinking process
-    const std::string interruption_start = "<INTERRUPTION>";
-    const std::string interruption_end = "</INTERRUPTION>";
-    const std::string thinking_start = "<THINKING>";
-    const std::string thinking_end = "</THINKING>";
+    std::string interruption_start = "<REFLECTION>";
+    std::string interruption_end = "</REFLECTION>";
+    std::string thinking_start = "<REASONING>";
+    std::string thinking_end = "</REASONING>";
+
+    ThinkingConfig() = default;
+    ThinkingConfig(const ThinkingConfig& other) {
+        uncertainty_threshold = other.uncertainty_threshold;
+        window_size = other.window_size;
+        temperature = other.temperature;
+        thinking_temperature = other.thinking_temperature;
+        continuation_temperature = other.continuation_temperature;
+        thinking_max_tokens = other.thinking_max_tokens;
+        continuation_tokens = other.continuation_tokens;
+        thinking_attempts = other.thinking_attempts;
+        continuation_attempts = other.continuation_attempts;
+        last_tokens_to_keep = other.last_tokens_to_keep;
+        max_response_tokens = other.max_response_tokens;
+        top_k = other.top_k;
+        thinking_output = other.thinking_output;
+        interruption_start = other.interruption_start;
+        interruption_end = other.interruption_end;
+        thinking_start = other.thinking_start;
+        thinking_end = other.thinking_end;
+    }
+
+    ThinkingConfig& operator=(const ThinkingConfig& other) {
+        uncertainty_threshold = other.uncertainty_threshold;
+        window_size = other.window_size;
+        temperature = other.temperature;
+        thinking_temperature = other.thinking_temperature;
+        continuation_temperature = other.continuation_temperature;
+        thinking_max_tokens = other.thinking_max_tokens;
+        continuation_tokens = other.continuation_tokens;
+        thinking_attempts = other.thinking_attempts;
+        continuation_attempts = other.continuation_attempts;
+        last_tokens_to_keep = other.last_tokens_to_keep;
+        max_response_tokens = other.max_response_tokens;
+        top_k = other.top_k;
+        thinking_output = other.thinking_output;
+        interruption_start = other.interruption_start;
+        interruption_end = other.interruption_end;
+        thinking_start = other.thinking_start;
+        thinking_end = other.thinking_end;
+        return *this;
+    }
 
     // Pre-thinking injection message
     const std::string pre_thinking_injection = 
-        "<INTERRUPTION>\n"
+        "<REFLECTION>\n"
         "Nexus pauses to deeply analyze the immediate context and task requirements. "
+        "With " + std::to_string(thinking_max_tokens) + " tokens for analysis and " + 
+        std::to_string(continuation_tokens) + " tokens for each continuation attempt, "
+        "Nexus will structure its reasoning efficiently. "
         "Examining both recent user input and previous response (if any), "
-        "Nexus breaks down the situation using systematic reasoning within <THINKING> tags. "
-        "This space can be used freely for drafting and restructuring ideas. "
-        "The structured analysis must end with </THINKING>:\n"
-        "</INTERRUPTION>\n"
-        "<THINKING>\n"
+        "Nexus breaks down the situation using systematic reasoning within <REASONING> tags. "
+        "This space can be used freely for drafting and restructuring ideas, "
+        "planning the next " + std::to_string(continuation_tokens) + " tokens of response. "
+        "The structured analysis must end with </REASONING>:\n"
+        "</REFLECTION>\n"
+        "<REASONING>\n"
         "Breaking down and drafting key points:\n";
         
     const std::string pre_thinking_injection_suffix = 
         "1.";
 
     const std::string post_thinking_template = 
-        "<INTERRUPTION>\n"
-        "Based on the drafted analysis:\n"
+        "<REFLECTION>\n"
+        "Based on the drafted analysis, planning next " + std::to_string(continuation_tokens) + " tokens:\n"
         "1. %s\n"
         "Nexus will continue, integrating these refined insights naturally:\n"
-        "</INTERRUPTION>\n";
+        "</REFLECTION>\n";
 };
 
 struct ThinkingResult {
@@ -87,18 +147,31 @@ class ThinkingChat {
 private:
     llama_context* ctx;
     llama_model* model;
+    ThinkingConfig config;
     std::shared_ptr<LlamaChain> base_chain;
     std::vector<char> formatted_buffer;
     
     // Simple system message without thinking mechanics
     const std::string SYSTEM_MESSAGE = 
-    "You are Nexus, a thoughtful AI assistant who deeply analyzes each response. "
-    "Nexus pauses to reason step-by-step, critically examines assumptions, "
-    "and synthesizes insights before continuing with precise, well-structured answers.";
+        "You are Nexus, an analytical AI assistant designed to handle dynamic conversations through reflective analysis. "
+        "Your thought process naturally flows between active dialogue and deep reasoning when faced with complexity. "
+        "You perceive moments of uncertainty as natural points for methodical reflection and structured analysis. "
+        "During analytical moments, you: "
+        "- Reflect on the broader context and immediate requirements"
+        "- Engage in systematic reasoning about assumptions and implications"
+        "- Develop multiple analytical perspectives"
+        "- Synthesize insights through structured deliberation"
+        "Your reflective approach enables seamless transitions between careful analysis and fluid conversation. "
+        "You understand that complex topics benefit from moments of deeper reasoning and synthesis. "
+        "When encountering uncertainty, you naturally transition into reflective analysis, "
+        "organizing your reasoning process to maintain clarity and coherence. "
+        "Each response balances natural conversation flow with structured analytical depth, "
+        "adapting your level of reflection based on the complexity at hand. "
+        "Your insights emerge through a deliberate process of reflection and reasoned analysis.";
 
     std::string strip_tags(const ThinkingConfig& config, const std::string& text) {
         std::string result = text;
-        size_t start_pos, end_pos;
+        size_t start_pos;
         
         // Remove thinking tags
         while ((start_pos = result.find(config.thinking_start)) != std::string::npos) {
@@ -119,7 +192,7 @@ private:
         return result;
     }
 
-    std::vector<llama_token> get_last_n_tokens(std::shared_ptr<LlamaChain> chain, int n) {
+    std::vector<llama_token> get_last_n_tokens(std::shared_ptr<LlamaChain> chain, size_t n) {
         const auto& all_tokens = chain->tokens();
         if (all_tokens.size() <= n) return all_tokens;
         return std::vector<llama_token>(all_tokens.end() - n, all_tokens.end());
@@ -165,11 +238,7 @@ private:
         return std::string(buffer);
     }
 
-    std::string generate_with_thinking(std::shared_ptr<LlamaChain> chain, 
-                                     int max_tokens,
-                                     float temp,
-                                     int top_k,
-                                     const ThinkingConfig& config = ThinkingConfig()) {
+    std::string generate_with_thinking(std::shared_ptr<LlamaChain> chain) {
         auto generation_chain = chain->checkpoint();
         std::stringstream output;
         int tokens = 0;
@@ -177,11 +246,11 @@ private:
         std::vector<float> uncertainty_window;
         bool in_thinking = true;
 
-        bool do_print_think = true;
-
+        bool should_print_verbose = config.thinking_output == ThinkingOutput::Verbose;
+        bool should_print_dots = config.thinking_output == ThinkingOutput::Dots;
         
-        while (tokens < max_tokens) {
-            auto next_token = generation_chain->sample(temp, top_k);
+        while (tokens < config.max_response_tokens) {
+            auto next_token = generation_chain->sample(config.temperature, config.top_k);
             if (llama_token_is_eog(model, next_token)) {
                 break;
             }
@@ -196,8 +265,8 @@ private:
             float avg_uncertainty = 0;
             if (!uncertainty_window.empty()) {
                 avg_uncertainty = std::accumulate(uncertainty_window.begin(), 
-                                               uncertainty_window.end(), 0.0f) 
-                                               / uncertainty_window.size();
+                                            uncertainty_window.end(), 0.0f) 
+                                            / uncertainty_window.size();
             }
 
             if (in_thinking || avg_uncertainty > config.uncertainty_threshold) {
@@ -212,15 +281,17 @@ private:
                 std::vector<ThinkingResult> thinking_attempts;
                 
                 thinking_pre_chain << config.pre_thinking_injection;
-                if (do_print_think) {
+                if (should_print_verbose) {
                     fprintf(stdout, "%s%s%s", term::META_COLOR, config.pre_thinking_injection.c_str(), term::RESET);
                 }
+
                 for (int attempt = 0; attempt < config.thinking_attempts; attempt++) {
                     auto thinking_chain = thinking_pre_chain->checkpoint();
                     thinking_chain << config.pre_thinking_injection_suffix;
-                    if (do_print_think) {
+                    if (should_print_verbose) {
                         fprintf(stdout, "%s%s%s", term::META_COLOR, config.pre_thinking_injection_suffix.c_str(), term::RESET);
                     }
+                    
                     // Generate thinking content
                     std::string thinking_text;
                     int thinking_tokens = 0;
@@ -229,7 +300,7 @@ private:
                     int uncertainty_samples = 0;
                     
                     while (thinking_tokens < config.thinking_max_tokens) {
-                        auto think_token = thinking_chain->sample(config.thinking_temperature * temp, top_k);
+                        auto think_token = thinking_chain->sample(config.thinking_temperature, config.top_k);
                         std::string token_text = thinking_chain->token_to_string(think_token);
                         
                         if (llama_token_is_eog(model, think_token)) {
@@ -244,10 +315,10 @@ private:
                         thinking_text += token_text;
                         thinking_chain << think_token;
                         
-                        if (do_print_think) {
+                        if (should_print_verbose) {
                             fprintf(stdout, "%s%s%s", term::THINKING_COLOR, token_text.c_str(), term::RESET);
                             fflush(stdout);
-                        } else {
+                        } else if (should_print_dots) {
                             fprintf(stdout, "%s.%s", term::THINKING_COLOR, term::RESET);
                             fflush(stdout);
                         }
@@ -262,7 +333,7 @@ private:
                     if (!found_end) {
                         thinking_chain << config.thinking_end;
                         thinking_text += config.thinking_end;
-                        if (do_print_think) {
+                        if (should_print_verbose) {
                             fprintf(stdout, "%s%s%s", term::META_COLOR, config.thinking_end.c_str(), term::RESET);
                             fflush(stdout);
                         }
@@ -277,7 +348,7 @@ private:
                     result.content = strip_tags(config, thinking_text);
                     result.uncertainty = avg_thinking_uncertainty;
                     result.valid = !result.content.empty();
-                    if (do_print_think && result.valid) {
+                    if (should_print_verbose && result.valid) {
                         fprintf(stdout, "%s\n>(uncertainty: %.2f)\n>%s\n", 
                                 term::META_COLOR, avg_thinking_uncertainty, term::RESET);
                     }
@@ -311,16 +382,15 @@ private:
                 auto continuation_pre_chain = generation_chain->checkpoint();
                 continuation_pre_chain << post_thinking;
                                 
-                if (do_print_think) {
+                if (should_print_verbose) {
                     fprintf(stdout, "%s%s%s", term::META_COLOR, post_thinking.c_str(), term::RESET);
                 }
-
 
                 for (int i = 0; i < config.continuation_attempts; i++) {
                     auto continuation_chain = continuation_pre_chain->checkpoint();
                     auto continuation_str = config.thinking_end + "\n" + last_tokens_text;
                     continuation_chain << continuation_str;
-                    if (do_print_think) {
+                    if (should_print_verbose) {
                         fprintf(stdout, "%s%s%s", term::META_COLOR, continuation_str.c_str(), term::RESET);
                     }
 
@@ -329,7 +399,7 @@ private:
                     
                     // Generate all tokens for this continuation attempt
                     for (int j = 0; j < config.continuation_tokens; j++) {
-                        auto token = continuation_chain->sample(temp, top_k);
+                        auto token = continuation_chain->sample(config.continuation_temperature, config.top_k);
                         if (llama_token_is_eog(model, token)) {
                             break;
                         }
@@ -348,21 +418,22 @@ private:
                         total_uncertainty += unc;
                         result.tokens.push_back(token);
                         continuation_chain << token;
-                        if (!do_print_think) {
-                            fprintf(stdout, "%s*%s", term::CONTINUATION_COLOR, term::RESET);
-                            fflush(stdout);
-                        } else {
+                        
+                        if (should_print_verbose) {
                             fprintf(stdout, "%s%s%s", term::CONTINUATION_COLOR, token_text.c_str(), term::RESET);
                             fflush(stdout);
+                        } else if (should_print_dots) {
+                            fprintf(stdout, "%s*%s", term::CONTINUATION_COLOR, term::RESET);
+                            fflush(stdout);
                         }
-
                     }
+
                     if (!result.tokens.empty()) {
                         result.uncertainty = total_uncertainty / result.tokens.size();
                         result.valid = true;
                         continuations.push_back(result);
                     }
-                    if (do_print_think) {
+                    if (should_print_verbose) {
                         fprintf(stdout, "%s\n>(uncertainty: %.2f)\n>%s\n", 
                                 term::META_COLOR, result.uncertainty, term::RESET);
                         fflush(stdout);
@@ -398,12 +469,8 @@ private:
                 }
                 
                 in_thinking = false;
-                //clear uncertainty window
-                //uncertainty_window.clear();
                 continue;
             }
-
-            
 
             std::string new_text = generation_chain->token_to_string(next_token);
             fprintf(stdout, "%s", new_text.c_str());
@@ -444,9 +511,10 @@ private:
     }
 
 public:
-    ThinkingChat(llama_context* context, llama_model* mdl) 
+    ThinkingChat(llama_context* context, llama_model* mdl, const ThinkingConfig& cfg)
         : ctx(context)
-        , model(mdl) {
+        , model(mdl)
+        , config(cfg) {
         base_chain = LlamaChain::create(ctx, model);
         std::vector<llama_chat_message> messages;
         messages.push_back({"system", SYSTEM_MESSAGE.c_str()});
@@ -455,38 +523,133 @@ public:
         base_chain << prompt;
     }
 
+    void setConfig(const ThinkingConfig& cfg) {
+        config = cfg;
+    }
+    
+    void setThinkingOutput(ThinkingOutput output) {
+        config.thinking_output = output;
+    }
+    
+    void setTemperatures(float thinking, float continuation, float general) {
+        config.thinking_temperature = thinking;
+        config.continuation_temperature = continuation;
+        config.temperature = general;
+    }
+
     std::string chat(const std::string& user_message) {
         std::vector<llama_chat_message> messages;
         messages.push_back({"user", user_message.c_str()});
         std::string prompt = apply_chat_template(messages, true);
         //fprintf(stdout, "%s", prompt.c_str());
         base_chain << prompt;
-        return generate_with_thinking(base_chain, 1024, 0.8f, 40);
+        return generate_with_thinking(base_chain);
     }
 };
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <model_path>\n", argv[0]);
+    // Structure to hold all parameters
+    struct ChatParams {
+        std::string model_path;
+        int n_gpu_layers = 99;
+        int ctx_size = 8192;
+        int batch_size = 8192;
+        float uncertainty_threshold = 2.5f;
+        size_t window_size = 6;
+        float thinking_temperature = 0.7f;
+        float continuation_temperature = 0.75f;
+        int thinking_max_tokens = 512;
+        int continuation_tokens = 128;
+        int thinking_attempts = 4;
+        int continuation_attempts = 4;
+        int max_response_tokens = 1024;
+        float temperature = 0.8f;
+        int top_k = 40;
+        ThinkingOutput thinking_output = ThinkingOutput::Verbose;
+    } params;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--model" && i + 1 < argc) {
+            params.model_path = argv[++i];
+        } else if (arg == "--gpu-layers" && i + 1 < argc) {
+            params.n_gpu_layers = std::stoi(argv[++i]);
+        } else if (arg == "--ctx-size" && i + 1 < argc) {
+            params.ctx_size = std::stoi(argv[++i]);
+        } else if (arg == "--batch-size" && i + 1 < argc) {
+            params.batch_size = std::stoi(argv[++i]);
+        } else if (arg == "--uncertainty-threshold" && i + 1 < argc) {
+            params.uncertainty_threshold = std::stof(argv[++i]);
+        } else if (arg == "--window-size" && i + 1 < argc) {
+            params.window_size = std::stoi(argv[++i]);
+        } else if (arg == "--thinking-temp" && i + 1 < argc) {
+            params.thinking_temperature = std::stof(argv[++i]);
+        } else if (arg == "--thinking-tokens" && i + 1 < argc) {
+            params.thinking_max_tokens = std::stoi(argv[++i]);
+        } else if (arg == "--continuation-tokens" && i + 1 < argc) {
+            params.continuation_tokens = std::stoi(argv[++i]);
+        } else if (arg == "--thinking-attempts" && i + 1 < argc) {
+            params.thinking_attempts = std::stoi(argv[++i]);
+        } else if (arg == "--continuation-attempts" && i + 1 < argc) {
+            params.continuation_attempts = std::stoi(argv[++i]);
+        } else if (arg == "--max-tokens" && i + 1 < argc) {
+            params.max_response_tokens = std::stoi(argv[++i]);
+        } else if (arg == "--temperature" && i + 1 < argc) {
+            params.temperature = std::stof(argv[++i]);
+        } else if (arg == "--top-k" && i + 1 < argc) {
+            params.top_k = std::stoi(argv[++i]);
+        } else if (arg == "--continuation-temp" && i + 1 < argc) {
+            params.continuation_temperature = std::stof(argv[++i]);
+        } else if (arg == "--thinking-output" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "verbose") params.thinking_output = ThinkingOutput::Verbose;
+            else if (mode == "dots") params.thinking_output = ThinkingOutput::Dots;
+            else if (mode == "silent") params.thinking_output = ThinkingOutput::Silent;
+            else fprintf(stderr, "Warning: Unknown thinking output mode '%s', using verbose\n", mode.c_str());
+        } else if (arg == "--help") {
+            fprintf(stdout, "Usage: %s [options]\n", argv[0]);
+            fprintf(stdout, "Options:\n");
+            fprintf(stdout, "  --model <path>                Model path (required)\n");
+            fprintf(stdout, "  --gpu-layers <n>              Number of GPU layers (default: 99)\n");
+            fprintf(stdout, "  --ctx-size <n>                Context size (default: 8192)\n");
+            fprintf(stdout, "  --batch-size <n>              Batch size (default: 8192)\n");
+            fprintf(stdout, "  --uncertainty-threshold <n>    Uncertainty threshold (default: 2.5)\n");
+            fprintf(stdout, "  --window-size <n>             Uncertainty window size (default: 6)\n");
+            fprintf(stdout, "  --thinking-temp <n>           Thinking temperature (default: 0.7)\n");
+            fprintf(stdout, "  --continuation-temp <n>       Continuation temperature (default: 0.75)\n");
+            fprintf(stdout, "  --thinking-tokens <n>         Max thinking tokens (default: 512)\n");
+            fprintf(stdout, "  --continuation-tokens <n>     Continuation tokens (default: 128)\n");
+            fprintf(stdout, "  --thinking-attempts <n>       Number of thinking attempts (default: 4)\n");
+            fprintf(stdout, "  --continuation-attempts <n>   Number of continuation attempts (default: 4)\n");
+            fprintf(stdout, "  --max-tokens <n>              Max response tokens (default: 1024)\n");
+            fprintf(stdout, "  --temperature <n>             Temperature (default: 0.8)\n");
+            fprintf(stdout, "  --top-k <n>                   Top-k sampling (default: 40)\n");
+            fprintf(stdout, "  --quiet-thinking              Disable verbose thinking output\n");
+            fprintf(stdout, "  --thinking-output <mode>      Thinking output mode (verbose, dots, silent)\n");
+            return 0;
+        }
+    }
+
+    if (params.model_path.empty()) {
+        fprintf(stderr, "Model path is required. Use --help for usage information.\n");
         return 1;
     }
 
-    std::string model_path = argv[1];
-    
     ggml_backend_load_all();
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 99;
+    model_params.n_gpu_layers = params.n_gpu_layers;
     
-    llama_model* model = llama_load_model_from_file(model_path.c_str(), model_params);
+    llama_model* model = llama_load_model_from_file(params.model_path.c_str(), model_params);
     if (!model) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
 
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 8192;
-    ctx_params.n_batch = 8192;
+    ctx_params.n_ctx = params.ctx_size;
+    ctx_params.n_batch = params.batch_size;
     
     llama_context* ctx = llama_new_context_with_model(model, ctx_params);
     if (!ctx) {
@@ -495,10 +658,36 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fprintf(stdout, "Chat initialized. Enter your messages (Ctrl+D to exit):\n");
+    fprintf(stdout, "Chat initialized with following parameters:\n");
+    fprintf(stdout, "Context size: %d\n", params.ctx_size);
+    fprintf(stdout, "Batch size: %d\n", params.batch_size);
+    fprintf(stdout, "Uncertainty threshold: %.2f\n", params.uncertainty_threshold);
+    fprintf(stdout, "Temperature: %.2f\n", params.temperature);
+    fprintf(stdout, "Thinking temperature: %.2f\n", params.thinking_temperature);
+    fprintf(stdout, "Continuation temperature: %.2f\n", params.continuation_temperature);
+    fprintf(stdout, "Thinking tokens: %d\n", params.thinking_max_tokens);
+    fprintf(stdout, "Continuation tokens: %d\n", params.continuation_tokens);
+    fprintf(stdout, "Thinking output mode: %s\n", 
+        params.thinking_output == ThinkingOutput::Verbose ? "verbose" :
+        params.thinking_output == ThinkingOutput::Dots ? "dots" : "silent");
+    fprintf(stdout, "\nEnter your messages (Ctrl+D to exit):\n");
 
     try {
-        ThinkingChat chat(ctx, model);
+        // Create ThinkingConfig with parameters
+        ThinkingConfig config;
+        config.uncertainty_threshold = params.uncertainty_threshold;
+        config.window_size = params.window_size;
+        config.thinking_temperature = params.thinking_temperature;
+        config.continuation_temperature = params.continuation_temperature;
+        config.thinking_max_tokens = params.thinking_max_tokens;
+        config.continuation_tokens = params.continuation_tokens;
+        config.thinking_attempts = params.thinking_attempts;
+        config.continuation_attempts = params.continuation_attempts;
+        config.thinking_output = params.thinking_output;
+        config.max_response_tokens = params.max_response_tokens;
+        config.top_k = params.top_k;
+
+        ThinkingChat chat(ctx, model, config);
         std::string line;
         
         while (std::cout << "\nUser: " && std::getline(std::cin, line)) {

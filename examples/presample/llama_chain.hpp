@@ -342,14 +342,38 @@ public:
     LogProbResult get_logprobs() const { return cached_logprobs_; }
 
     // Sampling interface
-    llama_token sample() {
+    llama_token sample(int top_k = 0) {
         auto logprobs = get_logprobs();
         apply_repetition_penalty(logprobs);
 
+        // Calculate metrics before top-k filtering
         auto metrics = UncertaintyMetrics::calculate(logprobs, vocab_size_);
         metrics_history_.push(metrics);
         if (metrics_history_.size() > MAX_HISTORY) {
             metrics_history_.pop();
+        }
+
+        // Apply top-k before sampling
+        if (top_k > 0 && top_k < vocab_size_) {
+            std::vector<std::pair<float, int>> pairs;
+            pairs.reserve(vocab_size_);
+            for (int i = 0; i < vocab_size_; i++) {
+                pairs.emplace_back(logprobs[i], i);
+            }
+            
+            // Partial sort to find top-k elements
+            std::partial_sort(pairs.begin(), 
+                            pairs.begin() + top_k, 
+                            pairs.end(),
+                            std::greater<>());
+            
+            // Set all logprobs outside top-k to negative infinity
+            float min_logprob = pairs[top_k - 1].first;
+            for (int i = 0; i < vocab_size_; i++) {
+                if (logprobs[i] < min_logprob) {
+                    logprobs[i] = -INFINITY;
+                }
+            }
         }
 
         if (!sampling_strategy_) {
@@ -365,7 +389,7 @@ public:
         } else {
             temp_strat->set_temperature(temp);
         }
-        return sample();
+        return sample(top_k);
     }
 
     void set_sampling_strategy(std::unique_ptr<SamplingStrategy> strategy) {
