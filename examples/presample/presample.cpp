@@ -49,25 +49,25 @@ struct ThinkingConfig {
     // Pre-thinking injection message
     const std::string pre_thinking_injection = 
         "<INTERRUPTION>\n"
-        "Nexus pauses to think privately about the immediate context (last part of conversation). "
-        "Looking at both the user's most recent input and Nexus's last response fragment (if available), "
-        "Nexus analyzes carefully with <THINKING> tags, challenging assumptions and "
-        "ensuring logical consistency. Analysis must be grounded in this recent context "
-        "and close with </THINKING> before continuing:\n"
+        "Nexus pauses to deeply analyze the immediate context and task requirements. "
+        "Examining both recent user input and previous response (if any), "
+        "Nexus breaks down the situation using systematic reasoning within <THINKING> tags. "
+        "This space can be used freely for drafting and restructuring ideas. "
+        "The structured analysis must end with </THINKING>:\n"
         "</INTERRUPTION>\n"
         "<THINKING>\n"
-        "Analyzing the immediate conversation context:\n";
+        "Breaking down and drafting key points:\n";
         
     const std::string pre_thinking_injection_suffix = 
         "1.";
 
     const std::string post_thinking_template = 
         "<INTERRUPTION>\n"
-        "Having analyzed the recent context:\n"
+        "Based on the drafted analysis:\n"
         "1. %s\n"
-        "Nexus will continue the response naturally, maintaining coherence with "
-        "both this analysis and the preceding conversation:\n";
-    };
+        "Nexus will continue, integrating these refined insights naturally:\n"
+        "</INTERRUPTION>\n";
+};
 
 struct ThinkingResult {
     std::string content;
